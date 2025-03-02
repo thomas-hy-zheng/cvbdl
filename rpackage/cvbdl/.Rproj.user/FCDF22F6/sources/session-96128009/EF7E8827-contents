@@ -1,0 +1,391 @@
+<<>>=
+pima <- read.table("pid.dat", header=TRUE, skip=0)
+@
+
+Define $X$ and $y$ appropriately
+<<>>=
+
+X <- as.matrix(pima[1:ncol(pima)-1])
+X <- cbind(rep(1,nrow(X)), X)
+
+y <- as.vector(ifelse(pima$diabetes == "neg", 0, 1))
+
+## Check:
+res = glm(y ~ X, family = binomial)
+sumres = summary(res)
+sumres$coefficients
+@
+
+Set up for the mu values
+<<>>=
+p = ncol(X)
+mus <- rep(0, p)
+ws <- rep(1, p)
+
+sigma = 10
+rho = 0.1
+@
+
+Define the system of updates for mu
+<<>>=
+get_likelis = function(mus, ws, X, y){
+  XW = X %*% diag(ws)
+  likelis = (t(y) %*% XW) %*% mus - sum(log(1 + exp(XW %*% mus )))
+  return(likelis)
+}
+
+expit = function(x){
+  1/(1+exp(-1*x))
+}
+
+my_norm = function(x){
+  sqrt(sum(x^2))
+}
+
+grad_likelis = function(mus, ws, X, y){
+  XW = X %*% diag(ws)
+  t(XW) %*% (y - expit(XW %*% mus))
+}
+
+hes_likelis = function(mus, ws, X, y){
+  XW = X %*% diag(ws)
+  m = expit(XW %*% mus)
+  w = as.vector(m * (1-m))
+  hessian = -1*t(XW*w) %*% XW
+  return(hessian)
+}
+
+get_grad = function(mus, ws, sigma, X, y){
+  as.vector(grad_likelis(mus, ws, X, y)) - 1/sigma^2 * mus
+}
+
+get_hes = function(mus, ws, sigma, X, y){
+  hes = hes_likelis(mus, ws, X, y)
+  hes - diag(1/sigma^2, nrow = nrow(hes), ncol = ncol(hes))
+}
+
+iterate_mu = function(mus, ws, sigma, X, y)
+{
+  inv = solve(get_hes(mus, ws, sigma, X, y))
+  return(mus - inv %*% get_grad(mus, ws, sigma, X, y))
+}
+
+solve_mus = function(ws, sigma, X, y)
+{
+  MAXITER = 100
+  mus_hats = rep(0, p)
+
+  eps = 10e-5; diff = 1
+
+  for (ITER in 1:MAXITER) {
+
+    mus_hats_new = iterate_mu(mus_hats, ws, sigma, X, y)
+    diff = my_norm(mus_hats_new - mus_hats)
+    mus_hats = mus_hats_new
+
+    if (diff < eps) {
+      break;
+    }
+  }
+
+  mus_hats[ws < 0.001] = 0
+  return(as.vector(mus_hats))
+}
+
+@
+
+Next, we implement the collapsed vb method.
+
+<<>>=
+get_tau <- function(mus, w_jk, rho, X, y, k){
+  tau = get_likelis(mus, w_jk, X, y) -1/(2*sigma^2)*my_norm(mus)^2 - 1/2 * log(det(-1*get_hes(mus, w_jk, sigma, X, y))) + k*log(rho/(1-rho))
+  return(tau)
+}
+
+solve_ws = function(mus, ws, rho, X, y){
+
+  w_updated = ws
+
+  for(j in 1:p){
+    w1 = ws; w1[j] = 1
+    w0 = ws; w0[j] = 0
+    tau1 = get_tau(mus, w1, rho, X, y, 1)
+    tau0 = get_tau(mus, w0, rho, X, y, 0)
+    w_updated[j] = 1/(1+exp(tau0- tau1))
+  }
+  return(w_updated)
+}
+@
+
+implement the solve
+
+<<>>=
+
+cvb_model <- function(sigma, rho, X, y, MAXITER = 100){
+
+  mus = rep(0, p)
+  ws = rep(1, p)
+
+  eps = 1e-5
+  diff = 1
+  its = 1
+
+  for(ITER in 1:MAXITER){
+
+    mus_next = solve_mus(ws, sigma, X, y)
+    ws_next = solve_ws(mus_next, ws, rho, X, y)
+
+    diff = sum(c(mus_next - mus, ws_next - ws)^2)
+
+    mus = mus_next
+    ws = ws_next
+    its = its + 1
+
+    if (diff < eps)
+    {
+      # print(paste("Model was able to converge :D"))
+      break
+    }
+  }
+  if (its == MAXITER){
+    print("Model was not able to converge. Results may not be accurate.")
+  }
+  res = list(mus = mus, ws =ws)
+  return(res)
+}
+
+@
+
+<<>>=
+res = cvb_model(10, 0.1, X, y)
+mus = res$mus
+ws = res$ws
+
+freq_p_values = ifelse(as.vector(sumres$coefficients[,4]) < 0.05, 1,0)
+ws_values = round(ws,2)
+rbind(sumres$coefficients[,4], ws_values)
+rbind(round(sumres$coefficients[,1],3), round(mus, 3))
+@
+
+Now, we apply cross validation.
+
+<<>>=
+classifier <- function(mus, ws, data){
+  fit = expit(data %*% diag(ws) %*% mus)
+  fit = ifelse(fit > 0.5, 1, 0)
+  return(fit)
+}
+@
+
+<<>>=
+cross_validate <- function(K, sigma, rho, data, results, reps = 50, shift = 0){
+
+  X = data
+  y = results
+  K = 10
+
+  error_vector = vector(length = reps)
+
+  samp_num = nrow(X) %/% K
+  remainder = nrow(X) %% K
+  n = nrow(X)-remainder
+
+  for (j in 1:reps){
+
+    set.seed(j +shift)
+    rand_samp = sample(c(1:n), n, replace = FALSE)
+    rand_mat = matrix(rand_samp, nrow = K, ncol = samp_num, byrow = FALSE)
+
+    err = vector(length = K)
+
+    for (i in 1:K){
+      test_set = X[rand_mat[i,],]
+      test_outcomes = y[rand_mat[i,],]
+      train_set = X[rand_mat[-i,],]
+      train_outcomes = y[rand_mat[-i,],]
+
+      fit = cvb_model(sigma, rho, train_set, train_outcomes)
+      results = classifier(fit$mus, fit$ws, test_set)
+      err[i] =  sum(results != test_outcomes)
+    }
+    error_vector[j] = sum(err)/n
+  }
+  return(mean(error_vector))
+}
+
+
+cross_validate_freq <- function(formula, data, results, reps = 50, shift = 0){
+
+  X = data
+  y = results
+  K = 10
+
+  error_vector = vector(length = reps)
+
+  samp_num = nrow(X) %/% K
+  remainder = nrow(X) %% K
+  n = nrow(X)-remainder
+
+  for (j in 1:reps){
+
+    set.seed(j + shift)
+    rand_samp = sample(c(1:n), n, replace = FALSE)
+    rand_mat = matrix(rand_samp, nrow = K, ncol = samp_num, byrow = FALSE)
+    err = vector(length = K)
+
+    for (i in 1:K){
+
+      test_set = X[rand_mat[i,],]
+      test_outcomes = y[rand_mat[i,],]
+      train_set = X[rand_mat[-i,],]
+      train_outcomes = y[rand_mat[-i,],]
+
+      a = glm(formula, data = pima[rand_mat[-i,],], family = "binomial" )
+      results = predict(a, pima[rand_mat[i,],] , type = "response")
+      results = ifelse(results >= 0.5, 1, 0)
+      err[i] =  sum(results != test_outcomes)
+    }
+    error_vector[j] = sum(err)/n
+  }
+  return(mean(error_vector))
+}
+
+@
+
+
+
+<<>>=
+library(randomForest)
+
+cross_validate_rf <- function(data, results, reps = 50, shift = 0){
+
+  X = data
+  y = results
+  K = 10
+
+  error_vector = vector(length = reps)
+
+  samp_num = nrow(X) %/% K
+  remainder = nrow(X) %% K
+  n = nrow(X)-remainder
+
+  for (j in 1:reps){
+
+    set.seed(j + shift)
+    rand_samp = sample(c(1:n), n, replace = FALSE)
+    rand_mat = matrix(rand_samp, nrow = K, ncol = samp_num, byrow = FALSE)
+    err = vector(length = K)
+
+    for (i in 1:K){
+
+      test_set = X[rand_mat[i,],]
+      test_outcomes = y[rand_mat[i,],]
+      train_set = X[rand_mat[-i,],]
+      train_outcomes = y[rand_mat[-i,],]
+
+      a = randomForest(formula = as.factor(diabetes) ~ ., data = pima[rand_mat[-i,],] )
+      results = predict(a, pima[rand_mat[i,],] )
+      results = ifelse(results == "pos", 1, 0)
+      err[i] =  sum(results != test_outcomes)
+    }
+    error_vector[j] = sum(err)/n
+  }
+  return(mean(error_vector))
+}
+
+cross_validate_kNN <- function(data, results, reps = 50, shift = 0){
+
+  X = data
+  y = results
+  K = 10
+
+  error_vector = vector(length = reps)
+
+  samp_num = nrow(X) %/% K
+  remainder = nrow(X) %% K
+  n = nrow(X)-remainder
+
+  for (j in 1:reps){
+
+    set.seed(j + shift)
+    rand_samp = sample(c(1:n), n, replace = FALSE)
+    rand_mat = matrix(rand_samp, nrow = K, ncol = samp_num, byrow = FALSE)
+    err = vector(length = K)
+
+    for (i in 1:K){
+
+      test_set = X[rand_mat[i,],]
+      test_outcomes = y[rand_mat[i,]]
+      train_set = X[rand_mat[-i,],]
+      train_outcomes = y[rand_mat[-i,]]
+
+      results = class::knn(train =  train_set,  test = test_set, cl= train_outcomes, k = 5)
+      # results = ifelse(results == "pos", 1, 0)
+      err[i] =  sum(results != test_outcomes)
+    }
+    error_vector[j] = sum(err)/n
+  }
+  return(mean(error_vector))
+}
+
+@
+
+
+<<>>=
+# M0 = glm(formula = as.factor(diabetes) ~ 1, data = pima, family = "binomial" ) # Null model
+# M1 = glm(formula = as.factor(diabetes) ~ ., data = pima, family = "binomial" ) # Full model
+# step.fwd.aic = step(M0, scope = list(lower = M0, upper = M1),
+#                     direction = "forward", trace = FALSE)
+# summary(step.fwd.aic)
+@
+
+<<>>=
+# step.back.aic = step(M1, direction = "back", trace = FALSE)
+# summary(step.back.aic)
+@
+
+<<>>=
+# library(leaps)
+# exh = regsubsets(as.factor(diabetes) ~., data = pima, nvmax = 15)
+# summary(exh)$outmat
+@
+
+
+
+
+
+<<>>=
+
+B = 30
+
+# Obtain cross-validation RMSE for cv
+errors_cv = NULL
+errors_glm1 = NULL
+errors_glm2 = NULL
+errors_glm3 = NULL
+errors_glm4 = NULL
+errors_glm5 = NULL
+errors_rf = NULL
+errors_knn = NULL
+
+for (i in 1:B){
+  shift = 8*i
+  errors_cv[i] <- cross_validate(K = 10, sigma = 14, rho = 0.09, data = X, results = y, reps = 1, shift = shift)
+  errors_glm1[i] <- cross_validate_freq(formula = as.factor(diabetes) ~ glucose ,data  = X, reps = 1, results = y, shift = shift)
+  errors_glm2[i] <- cross_validate_freq(formula = as.factor(diabetes) ~ glucose + age ,data  = X, reps = 1, results = y, shift = shift)
+  errors_glm3[i] <- cross_validate_freq(formula = as.factor(diabetes) ~ glucose +age+mass,data  = X, reps = 1, results = y, shift = shift)
+  errors_glm4[i] <- cross_validate_freq(formula = as.factor(diabetes) ~ glucose +age+mass+pedigree,data  = X, reps = 1, results = y, shift = shift)
+  errors_glm5[i] <- cross_validate_freq(formula = as.factor(diabetes) ~ . ,data  = X, reps = 1, results = y, shift = shift)
+  errors_rf[i] <- cross_validate_rf(data  = X, reps = 1, results = y, shift = shift)
+  errors_knn[i] <- cross_validate_kNN(data  = X, reps = 1, results = y, shift = shift)
+}
+
+save(errors_cv, errors_glm1,errors_glm2,errors_glm3,errors_glm4, errors_glm5,errors_rf,errors_knn, file = "errors_glm.RData")
+
+boxplot(errors_cv, errors_glm1,errors_glm2,errors_glm3,errors_glm4, errors_glm5, errors_rf, errors_knn, main = "Cross - Validation Error")
+
+@
+
+
+
+

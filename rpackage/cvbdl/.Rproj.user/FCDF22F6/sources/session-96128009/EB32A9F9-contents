@@ -1,0 +1,28 @@
+library(tidyverse)
+library(spls)
+library(cvbdl)
+
+data(prostate)
+x_reduced = prostate$x[,1:150]
+X <- cbind(rep(1,nrow(x_reduced)), x_reduced)
+y = prostate$y
+
+df_xy = data.frame(y,X)
+# res = glm(y ~ X, family = binomial)
+
+labs = c(1e-5,1e-4,1e-3,1e-2,1e-1,0.2,0.4,0.6,0.8,0.9,0.99)
+count = rep(0,length(labs))
+num = 1
+for (rho in labs){
+  print(paste("working on rho = ",rho))
+  res = cvbdl::cvb_model(10, rho, X, y)
+  count[num] = sum(res$ws > 0.5)
+  num = num+1
+}
+names(count) <- labs
+
+# Create a basic plot
+plot(count, type = "p", pch = 3, xaxt = "n", xlab = "rho", ylab = "Number of predictors selected")  # 'xaxt = "n"' suppresses the x-axis
+# Add custom x-axis
+lines(x = c(1:length(labs)), y = count)
+axis(1, at = 1:length(labs), labels = labs)
